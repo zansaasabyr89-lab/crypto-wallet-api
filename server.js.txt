@@ -1,0 +1,153 @@
+// server.js
+import express from 'express';
+import cors from 'cors';
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Память вместо БД (для старта). Потом можно заменить на MongoDB/Postgres.
+const db = { users: [] };
+
+const START_BALANCE = 0.125;
+const REWARD = 0.0003;
+
+function genAddress() {
+  const chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  let addr = '1';
+  for (let i = 0; i < 33; i++) addr += chars[Math.floor(Math.random() * chars.length)];
+  return addr;
+}
+function normalizePhone(masked) {
+  let digits = String(masked || '').replace(/\D/g, '');
+  if (digits.startsWith('7')) digits = '8' + digits.slice(1);
+  if (!digits.startsWith('8')) digits = '8' + digits;
+  return digits.slice(0, 11);
+}
+function nowISO() { return new Date().toISOString(); }
+function maskNameShort(u) {
+  const f = (u.firstName || '').trim();
+  const l = (u.lastName || '').trim();
+  return f ? `${f}.${l ? l[0].toUpperCase() : ''}` : '—';
+}
+
+// Регистрация
+app.post('/api/register', (req, res) => {
+  const { firstName, lastName, phone, pin, role } = req.body || {};
+  const p = normalizePhone(phone);
+  if (!firstName || !lastName || !p || !pin || !/^\d{4,6}$/.test(pin)) {
+    return res.status(400).json({ error: 'invalid_input' });
+  }
+  if (db.users.find(u => u.phone === p)) {
+    return res.status(409).json({ error: 'exists' });
+  }
+  const user = {
+    phone: p,
+    firstName,
+    lastName,
+    pin,
+    role: role === 'admin' ? 'admin' : 'user',
+    blocked: false,
+    balance: START_BALANCE,
+    address: genAddress(),
+    history: []
+  };
+  db.users.push(user);
+  res.json({ ok: true, user });
+});
+
+// Вход
+app.post('/api/login', (req, res) => {
+  const { phone, pin } = req.body || {};
+  const p = normalizePhone(phone);
+  const user = db.users.find(u => u.phone === p);
+  if (!user) return res.status(404).json({ error: 'not_found' });
+  if (user.blocked) return res.status(403).json({ error: 'blocked' });
+  if (user.pin !== pin) return res.status(401).json({ error: 'bad_pin' });
+  res.json({ ok: true, user });
+});
+
+// Профиль
+app.get('/api/user/:phone', (req, res) => {
+  const p = normalizePhone(req.params.phone);
+  const user = db.users.find(u => u.phone === p);
+  if (!user) return res.status(404).json({ error: 'not_found' });
+  res.json({ ok: true, user });
+});
+
+// Список пользователей
+app.get('/api/users', (req, res) => {
+  res.json({ ok: true, users: db.users });
+});
+
+// Обновить адрес
+app.post('/api/address', (req, res) => {
+  const { phone } = req.body || {};
+  const p = normalizePhone(phone);
+  const user = db.users.find(u => u.phone === p);
+  if (!user) return res.status(404).json({ error: 'not_found' });
+  user.address = genAddress();
+  res.json({ ok: true, address: user.address });
+});
+
+// Отправить транзакцию
+app.post('/api/transaction', (req, res) => {
+  const { fromPhone, toPhone, amount, fee, note } = req.body || {};
+  const from = normalizePhone(fromPhone);
+  const to = normalizePhone(toPhone);
+  const a = Number(amount);
+  const f = Number(fee);
+
+  const sender = db.users.find(u => u.phone === from);
+  const receiver = db.users.find(u => u.phone === to);
+  if (!sender || !receiver) return res.status(404).json({ error: 'user_not_found' });
+  if (sender.blocked) return res.status(403).json({ error: 'from_blocked' });
+  if (receiver.blocked) return res.status(403).json({ error: 'to_blocked' });
+  if (!a || a <= 0 || f < 0) return res.status(400).json({ error: 'bad_amount' });
+  if (from === to) return res.status(400).json({ error: 'self_transfer' });
+  if (sender.balance < a + f) return res.status(400).json({ error: 'insufficient' });
+
+  sender.balance = Number(sender.balance) - (a + f);
+  receiver.balance = Number(receiver.balance) + a;
+
+  const time = nowISO();
+  sender.history.push({ time, type: 'OUT', amount: a, other: receiver.phone, note: note || '' });
+  receiver.history.push({ time, type: 'IN', amount: a, other: sender.phone, note: note || '' });
+  if (f > 0) sender.history.push({ time, type: 'FEE', amount: f, other: 'NETWORK', note: 'Комиссия сети' });
+
+  res.json({ ok: true });
+});
+
+// История пользователя
+app.get('/api/history/:phone', (req, res) => {
+  const p = normalizePhone(req.params.phone);
+  const user = db.users.find(u => u.phone === p);
+  if (!user) return res.status(404).json({ error: 'not_found' });
+  res.json({ ok: true, history: user.history });
+});
+
+// Майнинг
+app.post('/api/mine', (req, res) => {
+  const { phone } = req.body || {};
+  const p = normalizePhone(phone);
+  const user = db.users.find(u => u.phone === p);
+  if (!user) return res.status(404).json({ error: 'not_found' });
+  if (user.blocked) return res.status(403).json({ error: 'blocked' });
+  user.balance = Number(user.balance) + REWARD;
+  user.history.push({ time: nowISO(), type: 'MINING', amount: REWARD, other: 'BLOCK', note: 'Награда за блок' });
+  res.json({ ok: true, balance: user.balance });
+});
+
+// Админ: блок/разблок
+app.post('/api/admin/toggle-block', (req, res) => {
+  const { adminPhone, targetPhone, block } = req.body || {};
+  const admin = db.users.find(u => u.phone === normalizePhone(adminPhone));
+  const target = db.users.find(u => u.phone === normalizePhone(targetPhone));
+  if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'no_admin' });
+  if (!target) return res.status(404).json({ error: 'target_not_found' });
+  target.blocked = !!block;
+  res.json({ ok: true, blocked: target.blocked });
+});
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log('API listening on ' + PORT));
